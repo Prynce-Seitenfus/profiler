@@ -135,13 +135,13 @@ NO_INST static bool check_filter(const void* fn_addr)
     return bitmap_test_bit(s_filter_bitmap, hash);
 }
 
-NO_INST void __cyg_profile_func_enter(void* this, void* call)
+NO_INST void __cyg_profile_func_enter(void* this_fn, void* call_site)
 {
     if (!s_enabled) {
         return;
     }
 
-    if (!check_filter(this)) {
+    if (!check_filter(this_fn)) {
         return;
     }
 
@@ -158,19 +158,19 @@ NO_INST void __cyg_profile_func_enter(void* this, void* call)
         s_overflowed = true;
     }
 
-    s_buffer[slot].this = this;
-    s_buffer[slot].call = call;
+    s_buffer[slot].this = this_fn;
+    s_buffer[slot].call = call_site;
     s_buffer[slot].timestamp = ts;
     s_buffer[slot].event = PROFILER_EVENT_ENTER;
 }
 
-NO_INST void __cyg_profile_func_exit(void* this, void* call)
+NO_INST void __cyg_profile_func_exit(void* this_fn, void* call_site)
 {
     if (!s_enabled) {
         return;
     }
 
-    if (!check_filter(this)) {
+    if (!check_filter(this_fn)) {
         return;
     }
 
@@ -187,8 +187,8 @@ NO_INST void __cyg_profile_func_exit(void* this, void* call)
         s_overflowed = true;
     }
 
-    s_buffer[slot].this = this;
-    s_buffer[slot].call = call;
+    s_buffer[slot].this = this_fn;
+    s_buffer[slot].call = call_site;
     s_buffer[slot].timestamp = ts;
     s_buffer[slot].event = PROFILER_EVENT_EXIT;
 }
