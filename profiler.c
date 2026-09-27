@@ -46,6 +46,7 @@ NO_INST void profiler_init(const profiler_config_t* config)
     s_capacity = config->capacity;
     s_mask = config->capacity - 1U;
     s_frequency = config->frequency;
+    profiler_port_init();
 }
 
 NO_INST uint32_t profiler_frequency(void)
@@ -145,7 +146,7 @@ NO_INST void __cyg_profile_func_enter(void* this_fn, void* call_site)
         return;
     }
 
-    uint32_t ts = (uint32_t)PROFILER_TICKS();
+    uint32_t ts = profiler_port_ticks();
 #if defined(__GNUC__) && (__GNUC__ >= 4)
     size_t idx = (size_t)__atomic_fetch_add(&s_write_index.value, 1U, __ATOMIC_RELAXED);
 #else
@@ -174,7 +175,7 @@ NO_INST void __cyg_profile_func_exit(void* this_fn, void* call_site)
         return;
     }
 
-    uint32_t ts = (uint32_t)PROFILER_TICKS();
+    uint32_t ts = profiler_port_ticks();
 #if defined(__GNUC__) && (__GNUC__ >= 4)
     size_t idx = (size_t)__atomic_fetch_add(&s_write_index.value, 1U, __ATOMIC_RELAXED);
 #else

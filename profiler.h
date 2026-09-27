@@ -21,7 +21,7 @@ struct Bitmap;
 typedef struct {
     void*     this;      /**< Pointer to the current function address. */
     void*     call;      /**< Pointer to the call site address. */
-    uint32_t  timestamp; /**< Raw tick counter snapshot from PROFILER_TICKS(). */
+    uint32_t  timestamp; /**< Raw timestamp counter snapshot from profiler_port_ticks(). */
     uint8_t   event;     /**< PROFILER_EVENT_ENTER or PROFILER_EVENT_EXIT. */
 } profiler_event_t;
 

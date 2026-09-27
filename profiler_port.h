@@ -1,38 +1,31 @@
 #ifndef PROFILER_PORT_H
 #define PROFILER_PORT_H
 
-#include <stdint.h>
+#include "profiler.h"
 
 /**
  * @file profiler_port.h
- * @brief Target-specific timestamp source for the generic profiler.
- *
- * This header provides the compile-time macro PROFILER_TICKS().
- * On embedded hardware (e.g. ARM Cortex-M), define this macro to sample
- * high-resolution hardware counters such as:
- *   #define PROFILER_TICKS() (DWT->CYCCNT)
- *   #define PROFILER_TICKS() (TIM2->CNT)
- *
- * For host-based unit testing (e.g., test_bench on Windows/MinGW), a fallback
- * implementation is provided if not externally defined.
+ * @brief Fixed target-port contract implemented by the application.
  */
 
-#ifndef PROFILER_TICKS
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define PROFILER_TICKS() ((uint32_t)__rdtsc())
-#elif defined(__x86_64__) || defined(__i386__)
-static inline uint32_t profiler_port_default_ticks(void)
-{
-    uint32_t lo;
-    uint32_t hi;
-    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
-    return lo;
-}
-#define PROFILER_TICKS() (profiler_port_default_ticks())
-#else
-#define PROFILER_TICKS() (0U)
+#ifdef __cplusplus
+extern "C" {
 #endif
-#endif /* PROFILER_TICKS */
+
+/**
+ * @brief Initializes the target's timestamp source.
+ */
+NO_INST void profiler_port_init(void);
+
+/**
+ * @brief Reads the target's free-running timestamp counter.
+ *
+ * @return Current timestamp counter value.
+ */
+NO_INST uint32_t profiler_port_ticks(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* PROFILER_PORT_H */
