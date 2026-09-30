@@ -112,9 +112,38 @@ ELF to resolve function and call-site addresses:
 python scripts/parse_prof_dump.py dump.txt --elf firmware.elf
 ```
 
+By default, the CSV is written next to the input dump with the same filename
+and a `.csv` extension (for example, `dump.txt` produces `dump.csv`). Use
+`--output` to choose a different path.
+
 The `arm-none-eabi-addr2line` executable must be on `PATH` (or specified with
 `--addr2line`). Use `--summary` for aggregate per-function statistics. If the
 dump wrapped its event buffer, calls whose matching event was overwritten
 cannot be timed; `--summary` reports unmatched entry and exit counts. Without
 `--elf`, addresses are retained instead of being resolved to function names.
 Pass `--frequency 32M` to override the dump's frequency.
+
+### Interpreting idle-wait measurements
+
+The H533 application overrides `sertos_port_idle_wait()` with an instrumented
+function that executes `WFI`. Its matched `ENTER`/`EXIT` duration is an
+**idle-window duration**, not exclusive idle CPU time: it includes the sleep
+interval and any interrupt handlers or higher-priority tasks that run before
+the idle task resumes. Treat it as an upper bound on idle CPU time, not as a
+direct measure of idle duty cycle. The default kernel implementation remains
+uninstrumented and performs the same `WFI` operation on bare-metal ports or
+yields on host simulator ports.
+
+### Interpreting blocking-wait measurements
+
+The H533 application overrides `sertos_port_wait()` with an instrumented
+pass-through to `sertos_scheduler_wait_list_block()`. Its matched `ENTER`/`EXIT`
+duration measures blocking wall-time: it includes wait-list bookkeeping, the
+context switch out and back, and the time the task remains blocked while other
+tasks or the idle task run. It is not CPU time consumed by the blocked task.
+
+For a matched synchronization API call, subtract its `sertos_port_wait()`
+duration from the API's total duration to estimate the API's exclusive CPU
+cost. A call that blocks more than once produces multiple wait intervals; sum
+them before subtracting. The default weak port implementation simply forwards
+to the scheduler and remains uninstrumented in the kernel library.
