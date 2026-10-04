@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, TextIO, Tuple
 
 
-HEADER_FORMAT = "<4sHHIIHH"
+HEADER_FORMAT = "<4sHHIHH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 RECORD_FORMAT = "<IIQII"
 RECORD_SIZE = struct.calcsize(RECORD_FORMAT)

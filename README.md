@@ -11,26 +11,40 @@ The `profiler` module implements GCC's function instrumentation hooks (`__cyg_pr
 - **In-Memory Cycle Accounting**: Tracks `call_count`, `total_cycles`, `min_cycles`, and `max_cycles` per unique function code address.
 - **Sub-Microsecond In-Place Accumulation**: Uses Knuth's multiplicative golden ratio hash and in-place reference lookup (`hashmap_get_ref`) to locate and update accumulators in single-digit CPU cycles.
 - **Single Shared Shadow Stack**: Measures exact elapsed function cycles across in-flight calls while safely dropping overflows when stack depth limits are reached.
-- **Packed Binary Protocol (`PROF-BIN v1`)**: Emits compact binary frames directly over `stream` with zero string formatting and zero-copy DMA bursts, sealed with an IEEE 802.3 CRC-32 trailer.
+- **Packed Binary Protocol (`PROF-BIN v2`)**: Emits compact binary frames directly over `Stream`, sealed with an IEEE 802.3 CRC-32 trailer.
 - **Anti-Recursion Protection**: All module symbols decorated with `NO_INST` (`__attribute__((no_instrument_function))`).
 
 ---
 
 ## Build System Integration
 
-The module is distributed as pure C source files (`profiler.h`, `profiler.c`, `profiler_port.h`) and must **not** be compiled into a static library archive (`.a`). Compile `profiler.c` directly into your application or firmware image along with `hashmap.c`. Implement target-specific timestamp and critical section functions declared in `profiler_port.h`.
-
-Crucially, **`profiler.c` and `hashmap.c` must NOT be compiled with `-finstrument-functions`**.
-
-Selectively enable function instrumentation on your application files in CMake:
+Add the module to a CMake project and link the exported `profiler` target. The transport is selected
+at configure time. The default `null` backend discards output; `memory` supports host tests;
+`uart_stm32_hal_dma` is for DMA-capable STM32 integrations; and `uart_stm32_hal_it` uses UART
+interrupt reception and blocking transmission for environments where DMA is unavailable, such as
+Renode's current STM32G0 model.
 
 ```cmake
-# Instrument target application files selectively
-set_source_files_properties(
-    <file>.c
-    PROPERTIES COMPILE_OPTIONS "-finstrument-functions"
-)
+set(PROFILER_TRANSPORT "uart_stm32_hal_dma" CACHE STRING "")
+add_subdirectory(path/to/profiler profiler_build)
+target_link_libraries(firmware PRIVATE profiler)
 ```
+
+The target exports `profiler.h`, `port/profiler_port.h`, and `port/profiler_transport.h`, and
+resolves the `hashmap` and `stream` dependencies from `modules/` or sibling repositories. Set
+`HASHMAP_DIR` or `STREAM_DIR` to override those locations. The library disables function
+instrumentation for its own sources; instrument only application sources.
+
+When using the STM32 backend, link it to the project's HAL interface target so CubeMX headers and
+HAL symbols are available:
+
+```cmake
+target_link_libraries(profiler PRIVATE stm32cubemx)
+```
+
+The UART backend defines the three global HAL UART callbacks it uses. Do not define
+`HAL_UART_TxCpltCallback`, `HAL_UART_ErrorCallback`, or `HAL_UARTEx_RxEventCallback` in the
+application while that backend is selected.
 
 ---
 
@@ -78,45 +92,73 @@ profiler_reset();
 
 ---
 
-## Porting
+## Transport Integration
 
-Implement the timestamp setup, tick reading, and critical section functions in `profiler_port.c`:
+The application owns the command protocol and profiler start/stop lifecycle. The selected
+transport backend supplies a `Stream` for `profiler_dump()` and exposes received frames through
+`profiler_transport_poll()` and `Stream.read`.
+
+Allocate transport buffers with static lifetime. DMA backends may require alignment and placement in
+DMA-reachable memory:
 
 ```c
-#include "profiler_port.h"
-#include "stm32h533xx.h"
+static uint8_t s_tx_buffer[256U] __attribute__((aligned(32)));
+static uint8_t s_rx_buffer[32U] __attribute__((aligned(32)));
 
-void profiler_port_init(void)
-{
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0U;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-}
+ProfilerTransportConfig transport_config = {
+    .device = &huart2,
+    .tx_buffer = s_tx_buffer,
+    .tx_buffer_size = sizeof(s_tx_buffer),
+    .rx_buffer = s_rx_buffer,
+    .rx_buffer_size = sizeof(s_rx_buffer),
+    .tx_timeout_ms = 1000U,
+    .tick_ms = profiler_tick_ms,
+    .yield = profiler_yield_ms
+};
 
-uint32_t profiler_port_ticks(void)
-{
-    return DWT->CYCCNT;
+if (profiler_transport_init(&transport_config) != PROFILER_TRANSPORT_STATUS_OK) {
+    Error_Handler();
 }
+if (profiler_transport_listen() != PROFILER_TRANSPORT_STATUS_OK) {
+    Error_Handler();
+}
+```
 
-uint32_t profiler_port_enter_critical(void)
-{
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    return primask;
-}
+In task context, poll the received frame, handle the command, call `profiler_dump()` with
+`profiler_transport_stream()`, check `profiler_transport_status()` after the dump to detect a
+flush failure, and re-arm reception. Keep HAL callbacks limited to latching transport events.
 
-void profiler_port_exit_critical(uint32_t state)
-{
-    __set_PRIMASK(state);
-}
+---
+
+## Porting & Platform Backends
+
+The module provides modular platform port backends selected via `PROFILER_PORT` in CMake:
+- `dwt`: Native ARM Cortex-M DWT `CYCCNT` (M3/M4/M7/M33/M55) with zero interrupt overhead.
+- `16bit_it`: Single 16-bit hardware timer extended with software overflow ISR (`profiler_port_16bit_it_overflow_isr`). Ideal for Cortex-M0/M0+, MSP430, AVR, and Renode simulation.
+- `2x16bit`: Cascaded Master/Slave 16-bit timers with rollover double-read glitch protection (e.g. STM32 TIM1+TIM3 hardware TRGO).
+- `win`: Native Windows host port using `QueryPerformanceCounter` and `CRITICAL_SECTION`.
+- `posix`: POSIX host port using `clock_gettime(CLOCK_MONOTONIC)` and `pthread_mutex`.
+- `riscv`: RISC-V hardware port reading CSR `mcycle` and atomic `mstatus` MIE masking.
+- `custom` (default): Application provides its own `profiler_port.c` implementing `port/profiler_port.h`.
+
+```cmake
+set(PROFILER_PORT "dwt" CACHE STRING "")
+set(PROFILER_TRANSPORT "uart_stm32_hal_dma" CACHE STRING "")
+add_subdirectory(path/to/profiler profiler_build)
+target_link_libraries(firmware PRIVATE profiler)
 ```
 
 ---
 
 ## Analyzing a Dump
 
-`parse_prof_dump.py` decodes the `PROF-BIN v1` binary format, verifies payload CRC-32 integrity, and resolves function addresses using `arm-none-eabi-addr2line`:
+`parse_prof_dump.py` decodes the `PROF-BIN v2` binary format, verifies payload CRC-32 integrity, and resolves function addresses using `arm-none-eabi-addr2line`:
 
 ```bash
 python parse_prof_dump.py dump.bin --elf firmware.elf --output report.csv --summary
 ```
+
+For interactive visualization, see [Perfetto UI](https://ui.perfetto.dev/) for traces or
+[Speedscope](https://www.speedscope.app/) for profiles. The profiler's binary dump and the parser's
+CSV output are not directly documented as compatible with either viewer; conversion to a supported
+trace or profile format may be needed.
