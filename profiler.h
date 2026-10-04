@@ -4,77 +4,90 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "hashmap.h"
 
-/* Forward declaration of Bitmap to avoid strict header dependency if unused */
-struct Bitmap;
+/* Forward declaration of Stream */
+struct Stream;
 
 #ifndef NO_INST
 #define NO_INST __attribute__((no_instrument_function))
 #endif
 
-#define PROFILER_EVENT_ENTER (0U)
-#define PROFILER_EVENT_EXIT  (1U)
+#define PROFILER_BIN_MAGIC    (0x464F5250U)
+#define PROFILER_BIN_VERSION  (0x0002U)
 
 /**
- * @brief Represents a single function enter/exit profiling event.
+ * @brief Aggregated runtime performance metrics for a unique instrumented function.
+ * Total size: 24 bytes (naturally 8-byte aligned on 32-bit and 64-bit architectures).
  */
-typedef struct {
-    void*     this;      /**< Pointer to the current function address. */
-    void*     call;      /**< Pointer to the call site address. */
-    uint32_t  timestamp; /**< Raw timestamp counter snapshot from profiler_port_ticks(). */
-    uint8_t   event;     /**< PROFILER_EVENT_ENTER or PROFILER_EVENT_EXIT. */
-} profiler_event_t;
+typedef struct ProfilerMetric {
+    uint32_t fn_address;   /**< Unique function code address (key). */
+    uint32_t call_count;   /**< Total number of completed invocations. */
+    uint64_t total_cycles; /**< Accumulated execution time in CPU cycles. */
+    uint32_t min_cycles;   /**< Minimum observed execution duration in cycles. */
+    uint32_t max_cycles;   /**< Maximum observed execution duration in cycles. */
+} ProfilerMetric;
 
 /**
- * @brief Profiler configuration passed by the application at startup.
+ * @brief Shadow call stack activation frame for active in-flight invocations.
  */
-typedef struct {
-    uint32_t          frequency; /**< Ticks per second, unit documented by app. */
-    profiler_event_t* buffer;    /**< Caller-allocated buffer, static lifetime. */
-    uint32_t          capacity;  /**< Must be a power of two (>= 2). */
-} profiler_config_t;
+typedef struct ProfilerStackFrame {
+    const void* fn_address;      /**< Address of the executing function. */
+    uint32_t    enter_timestamp; /**< Timestamp snapshot taken on entry. */
+} ProfilerStackFrame;
+
+/**
+ * @brief Binary protocol header for streaming dumps.
+ */
+typedef struct ProfilerBinHeader {
+    uint32_t magic;             /**< "PROF" magic identifier. */
+    uint16_t version;           /**< Protocol version (0x0002U). */
+    uint16_t record_count;      /**< Number of ProfilerMetric records following header. */
+    uint32_t frequency;         /**< Timestamp clock frequency in Hz. */
+    uint16_t dropped_functions; /**< Unique functions dropped due to capacity exhaustion. */
+    uint16_t stack_overflows;   /**< Calls dropped due to shadow call stack overflow. */
+} ProfilerBinHeader;
+
+/**
+ * @brief Application configuration provided to profiler_init().
+ */
+typedef struct ProfilerConfig {
+    uint32_t            frequency;        /**< Timestamp clock frequency in Hz. */
+    HashMapEntry*       map_entries;      /**< Static array of HashMapEntry (power of 2). */
+    size_t              map_capacity;     /**< Total slot capacity of map_entries (>= 2). */
+    ProfilerMetric*     metrics;          /**< Caller-allocated array of ProfilerMetric. */
+    size_t              metrics_capacity; /**< Capacity of metrics array (must be >= 75% of map_capacity). */
+    ProfilerStackFrame* stack_frames;     /**< Caller-allocated shadow call stack buffer. */
+    size_t              stack_depth;      /**< Maximum nesting depth of stack_frames. */
+} ProfilerConfig;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * @brief Initializes the profiler with caller-supplied buffer and configuration.
+ * @brief Initializes the profiler with caller-supplied buffers and configuration.
  *
- * Validates that config is non-NULL, buffer is non-NULL, and capacity is a power of 2 >= 2.
- * If validation fails, the profiler remains uninitialized and disabled.
- * Does not start event capture automatically.
+ * Validates parameters, initializes the internal HashMap container over map_entries,
+ * and resets all internal metric accumulators and shadow stack state.
  *
- * @param config Pointer to the configuration structure.
+ * @param[in] config Pointer to the configuration structure.
+ * @return true if initialized successfully, false on invalid parameters.
  */
-NO_INST void profiler_init(const profiler_config_t* config);
+NO_INST bool profiler_init(const ProfilerConfig* config);
 
 /**
- * @brief Returns the configured tick frequency (stored value for offline analysis).
- *
- * @return Frequency value supplied in profiler_init().
- */
-NO_INST uint32_t profiler_frequency(void);
-
-/**
- * @brief Returns the configured event buffer capacity.
- *
- * @return Capacity value supplied in profiler_init().
- */
-NO_INST uint32_t profiler_capacity(void);
-
-/**
- * @brief Enables function event capture.
+ * @brief Starts profiling by enabling instrumentation hooks.
  */
 NO_INST void profiler_start(void);
 
 /**
- * @brief Disables function event capture.
+ * @brief Stops profiling by disabling instrumentation hooks.
  */
 NO_INST void profiler_stop(void);
 
 /**
- * @brief Resets event write index and overflow flag without clearing configuration.
+ * @brief Resets all accumulated metrics, shadow call stack, diagnostics, and table entries.
  */
 NO_INST void profiler_reset(void);
 
@@ -86,32 +99,53 @@ NO_INST void profiler_reset(void);
 NO_INST bool profiler_enabled(void);
 
 /**
- * @brief Queries whether the ring buffer wrapped and overwrote older events.
+ * @brief Returns the configured timestamp frequency in Hz.
  *
- * @return true if overflow/wrap occurred since last init/reset.
+ * @return Frequency value supplied in profiler_init().
  */
-NO_INST bool profiler_overflowed(void);
+NO_INST uint32_t profiler_frequency(void);
 
 /**
- * @brief Reads a single recorded event in chronological order.
+ * @brief Returns the number of unique functions currently tracked in the hash map.
  *
- * Index 0 maps to the oldest surviving recorded event.
- *
- * @param index Logical event index (0 to count - 1).
- * @param out_event Destination buffer to copy event data.
- * @return true if event was successfully read, false if index is out of bounds or parameter invalid.
+ * @return Count of occupied metric entries.
  */
-NO_INST bool profiler_read_event(uint32_t index, profiler_event_t* out_event);
+NO_INST size_t profiler_tracked_count(void);
 
 /**
- * @brief Sets an optional bitmap filter for O(1) function filtering.
+ * @brief Returns the number of unique functions dropped due to full table capacity.
  *
- * When set, only functions whose address hash matches a set bit in the bitmap will be recorded.
- * Pass NULL to disable filtering and record all instrumented functions.
- *
- * @param filter Pointer to an initialized Bitmap structure, or NULL.
+ * @return Count of dropped unique functions.
  */
-NO_INST void profiler_set_filter_bitmap(const struct Bitmap* filter);
+NO_INST uint16_t profiler_dropped_functions_count(void);
+
+/**
+ * @brief Returns the count of calls dropped due to shadow stack overflow.
+ *
+ * @return Count of dropped shadow stack entries.
+ */
+NO_INST uint16_t profiler_stack_overflow_count(void);
+
+/**
+ * @brief Retrieves a copy of the metrics associated with a function address.
+ *
+ * @param[in]  fn_addr    Function address to look up.
+ * @param[out] out_metric Destination pointer to copy the metrics into.
+ * @return true if function was found, false otherwise.
+ */
+NO_INST bool profiler_get_metric(const void* fn_addr, ProfilerMetric* out_metric);
+
+/**
+ * @brief Streams packed binary profiler statistics over an abstract Stream.
+ *
+ * Emits the 16-byte ProfilerBinHeader, streams all ProfilerMetric records directly
+ * using zero-copy transfers, and finishes with a 32-bit CRC checksum.
+ * Does NOT reset accumulated statistics (cumulative telemetry across calls).
+ *
+ * @param[in] stream Pointer to the target Stream instance.
+ * @return true on successful transmission, false on stream error or invalid argument.
+ */
+NO_INST bool profiler_dump(const struct Stream* stream);
 
 #ifdef __cplusplus
 }

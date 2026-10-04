@@ -1,26 +1,26 @@
 # profiler
 
-Ultra-low-overhead, hardware-independent GCC function instrumentation profiler module written in ANSI/ISO C99.
+Ultra-low-overhead, hardware-independent GCC function execution profiler module written in ANSI/ISO C99.
 
 ## Overview
-The `profiler` module implements GCC's function instrumentation hooks (`__cyg_profile_func_enter` and `__cyg_profile_func_exit`) with minimal runtime overhead.
+The `profiler` module implements GCC's function instrumentation hooks (`__cyg_profile_func_enter` and `__cyg_profile_func_exit`) using an in-memory statistical aggregation model driven by `hashmap`. Rather than streaming raw chronological event traces that rapidly overflow circular buffers, `profiler` accumulates invocation counts, total execution cycles, minimum cycles, and maximum cycles per unique function directly in RAM.
 
 ### Key Architectural Highlights:
 - **Zero OS / Hardware Coupling**: Completely hardware-independent core. No CMSIS, vendor, or RTOS dependencies.
-- **Zero Dynamic Allocation**: All event buffers are caller-allocated and statically managed.
-- **Small Runtime Port Contract**: Target timestamp setup and reads are provided by two functions declared in `profiler_port.h`.
-- **Lock-Free Preemption Safety**: Reentrant slot reservation across tasks and ISRs via atomic fetch-and-add using `atomic.h`.
-- **Fast Power-of-Two Masking**: Bitwise ring buffer addressing (`index & (capacity - 1)`) without modulo or division operations.
+- **Zero Dynamic Allocation**: Freestanding operation over caller-allocated `HashMapEntry`, `ProfilerMetric`, and `ProfilerStackFrame` buffers (MISRA C:2012 Rule 21.3).
+- **In-Memory Cycle Accounting**: Tracks `call_count`, `total_cycles`, `min_cycles`, and `max_cycles` per unique function code address.
+- **Sub-Microsecond In-Place Accumulation**: Uses Knuth's multiplicative golden ratio hash and in-place reference lookup (`hashmap_get_ref`) to locate and update accumulators in single-digit CPU cycles.
+- **Single Shared Shadow Stack**: Measures exact elapsed function cycles across in-flight calls while safely dropping overflows when stack depth limits are reached.
+- **Packed Binary Protocol (`PROF-BIN v1`)**: Emits compact binary frames directly over `stream` with zero string formatting and zero-copy DMA bursts, sealed with an IEEE 802.3 CRC-32 trailer.
 - **Anti-Recursion Protection**: All module symbols decorated with `NO_INST` (`__attribute__((no_instrument_function))`).
-- **Optional O(1) Function Filtering**: Integrated with `bitmap.h` to skip recording high-frequency functions.
 
 ---
 
 ## Build System Integration
 
-The module is distributed as pure C source files (`profiler.h`, `profiler.c`, `profiler_port.h`) and must **not** be compiled into a static library archive (`.a`). Compile `profiler.c` directly into your application or firmware image. Add one target-specific `profiler_port.c` that implements the two functions declared in `profiler_port.h`.
+The module is distributed as pure C source files (`profiler.h`, `profiler.c`, `profiler_port.h`) and must **not** be compiled into a static library archive (`.a`). Compile `profiler.c` directly into your application or firmware image along with `hashmap.c`. Implement target-specific timestamp and critical section functions declared in `profiler_port.h`.
 
-Crucially, **`profiler.c` itself must NOT be compiled with `-finstrument-functions`**.
+Crucially, **`profiler.c` and `hashmap.c` must NOT be compiled with `-finstrument-functions`**.
 
 Selectively enable function instrumentation on your application files in CMake:
 
@@ -38,46 +38,49 @@ set_source_files_properties(
 
 ```c
 #include "profiler.h"
+#include "hashmap.h"
+#include "stream.h"
 
-/* 1. Allocate static buffer with power-of-two capacity */
-#define EVENT_CAPACITY 1024U
-static profiler_event_t s_event_buffer[EVENT_CAPACITY];
+/* 1. Allocate static buffers with power-of-two map capacity */
+#define MAP_CAPACITY     (64U)
+#define METRICS_CAPACITY (48U) /* 75% load limit */
+#define STACK_DEPTH      (16U)
+
+static HashMapEntry       s_map_entries[MAP_CAPACITY];
+static ProfilerMetric     s_metrics[METRICS_CAPACITY];
+static ProfilerStackFrame s_stack_frames[STACK_DEPTH];
 
 /* 2. Configure and initialize */
-profiler_config_t config = {
-    .frequency = 168000000U, /* e.g., 168 MHz CPU ticks */
-    .buffer    = s_event_buffer,
-    .capacity  = EVENT_CAPACITY
+ProfilerConfig config = {
+    .frequency        = 168000000U, /* e.g., 168 MHz CPU ticks */
+    .map_entries      = s_map_entries,
+    .map_capacity     = MAP_CAPACITY,
+    .metrics          = s_metrics,
+    .metrics_capacity = METRICS_CAPACITY,
+    .stack_frames     = s_stack_frames,
+    .stack_depth      = STACK_DEPTH
 };
 
 profiler_init(&config);
 
-/* 3. Start capturing */
+/* 3. Start profiling */
 profiler_start();
 
 /* ... run instrumented functions ... */
 
-/* 4. Stop capturing */
-profiler_stop();
+/* 4. Stream binary dump over abstract Stream transport (e.g. UART DMA) */
+profiler_dump(&my_stream);
 
-/* 5. Read back recorded events chronologically */
-profiler_event_t event;
-for (uint32_t i = 0U; profiler_read_event(i, &event); ++i) {
-    /* Process or dump event.this, event.call, event.timestamp, event.event */
-}
+/* 5. Stop or reset if needed */
+profiler_stop();
+profiler_reset();
 ```
 
 ---
 
 ## Porting
 
-Implement the timestamp setup and read functions in `profiler_port.c`. The
-profiler calls `profiler_port_init()` once for each valid `profiler_init()`
-configuration and calls `profiler_port_ticks()` when recording each event.
-Keep the hardware-specific headers and counter access in this file; the shared
-`profiler_port.h` does not need target-specific edits.
-
-An STM32 DWT port can be as small as:
+Implement the timestamp setup, tick reading, and critical section functions in `profiler_port.c`:
 
 ```c
 #include "profiler_port.h"
@@ -94,56 +97,26 @@ uint32_t profiler_port_ticks(void)
 {
     return DWT->CYCCNT;
 }
+
+uint32_t profiler_port_enter_critical(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+void profiler_port_exit_critical(uint32_t state)
+{
+    __set_PRIMASK(state);
+}
 ```
 
-A host port can initialize a monotonic clock and return its current count.
-Set `config.frequency` to the timestamp source's frequency so recorded values
-can be interpreted correctly.
+---
 
-## Analyzing a dump
+## Analyzing a Dump
 
-`scripts/parse_prof_dump.py` reads the `PROF-DUMP v1` text format and pairs each
-function's `ENTER` and `EXIT` events. It reports each matched call as CSV with
-the cycle count and elapsed time in microseconds. The script uses the frequency
-in the dump header by default; `--frequency` overrides it. Supply the firmware
-ELF to resolve function and call-site addresses:
+`parse_prof_dump.py` decodes the `PROF-BIN v1` binary format, verifies payload CRC-32 integrity, and resolves function addresses using `arm-none-eabi-addr2line`:
 
-```text
-python scripts/parse_prof_dump.py dump.txt --elf firmware.elf
+```bash
+python parse_prof_dump.py dump.bin --elf firmware.elf --output report.csv --summary
 ```
-
-By default, the CSV is written next to the input dump with the same filename
-and a `.csv` extension (for example, `dump.txt` produces `dump.csv`). Use
-`--output` to choose a different path.
-
-The `arm-none-eabi-addr2line` executable must be on `PATH` (or specified with
-`--addr2line`). Use `--summary` for aggregate per-function statistics. If the
-dump wrapped its event buffer, calls whose matching event was overwritten
-cannot be timed; `--summary` reports unmatched entry and exit counts. Without
-`--elf`, addresses are retained instead of being resolved to function names.
-Pass `--frequency 32M` to override the dump's frequency.
-
-### Interpreting idle-wait measurements
-
-The H533 application overrides `sertos_port_idle_wait()` with an instrumented
-function that executes `WFI`. Its matched `ENTER`/`EXIT` duration is an
-**idle-window duration**, not exclusive idle CPU time: it includes the sleep
-interval and any interrupt handlers or higher-priority tasks that run before
-the idle task resumes. Treat it as an upper bound on idle CPU time, not as a
-direct measure of idle duty cycle. The default kernel implementation remains
-uninstrumented and performs the same `WFI` operation on bare-metal ports or
-yields on host simulator ports.
-
-### Interpreting blocking-wait measurements
-
-The H533 application overrides `sertos_port_wait()` with an instrumented
-pass-through to `sertos_scheduler_wait_list_block()`. Its matched `ENTER`/`EXIT`
-duration measures blocking wall-time: it includes wait-list bookkeeping, the
-context switch out and back, and the time the task remains blocked while other
-tasks or the idle task run. It is not CPU time consumed by the blocked task.
-
-For a matched synchronization API call, subtract its `sertos_port_wait()`
-duration from the API's total duration to estimate the API's exclusive CPU
-cost. A call that blocks more than once produces multiple wait intervals; sum
-them before subtracting. The default weak port implementation simply forwards
-to the scheduler and remains uninstrumented in the kernel library.
