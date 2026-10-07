@@ -284,12 +284,17 @@ NO_INST void __cyg_profile_func_exit(void* this_fn, void* call_site)
     uint32_t ts = profiler_port_ticks();
     uint32_t state = profiler_port_enter_critical();
 
-    if (s_stack_index > 0U) {
-        const ProfilerStackFrame* frame = &s_stack_frames[s_stack_index - 1U];
-        if (frame->fn_address == this_fn) {
-            s_stack_index--;
-            uint32_t cycles = ts - frame->enter_timestamp;
+    for (size_t i = s_stack_index; i > 0U; --i) {
+        size_t idx = i - 1U;
+        if (s_stack_frames[idx].fn_address == this_fn) {
+            uint32_t cycles = ts - s_stack_frames[idx].enter_timestamp;
             update_metric(this_fn, cycles);
+
+            for (size_t j = idx; (j + 1U) < s_stack_index; ++j) {
+                s_stack_frames[j] = s_stack_frames[j + 1U];
+            }
+            s_stack_index--;
+            break;
         }
     }
 
